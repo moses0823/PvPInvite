@@ -1,0 +1,17 @@
+name: PvPInvite
+version: 1.0.0
+main: tw.pvpinvite.PvPInvite
+api-version: '26.2'
+author: PvPInvite
+description: PvP invitation plugin
+
+commands:
+  pvp:
+    description: PvP invitation commands
+    usage: /pvp <player|accept|deny|cancel|status>
+    permission: pvpinvite.use
+
+permissions:
+  pvpinvite.use:
+    description: Allows use of PvPInvite
+    default: true
