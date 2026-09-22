@@ -8,7 +8,7 @@ description: PvP invitation plugin
 commands:
   pvp:
     description: PvP invitation commands
-    usage: /pvp <player|accept|deny|cancel|status>
+    usage: /pvp <player|accept|deny|cancel|status|select-team|team-room>
     permission: pvpinvite.use
 
 permissions:

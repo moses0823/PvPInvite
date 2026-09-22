@@ -4,12 +4,20 @@ import org.bukkit.event.entity.PlayerDeathEvent;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.event.ClickEvent;
-import net.kyori.adventure.text.event.HoverEvent;
+import io.papermc.paper.dialog.Dialog;
+import io.papermc.paper.registry.data.dialog.ActionButton;
+import io.papermc.paper.registry.data.dialog.DialogBase;
+import io.papermc.paper.registry.data.dialog.body.DialogBody;
+import io.papermc.paper.registry.data.dialog.action.DialogAction;
+import io.papermc.paper.registry.data.dialog.type.DialogType;
 
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Projectile;
+import org.bukkit.boss.BarColor;
+import org.bukkit.boss.BarStyle;
+import org.bukkit.boss.BossBar;
 
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.EventPriority;
@@ -57,6 +65,14 @@ public final class PvPInvite extends JavaPlugin
      */
     private final Set<PairKey> activePairs = new HashSet<>();
 
+        private final Map<UUID, TeamRoom> roomsByPlayer = new HashMap<>();
+
+        private final Set<TeamRoom> activeTeamBattles = new HashSet<>();
+
+        private final Map<UUID, TeamInvite> pendingTeamInvites = new HashMap<>();
+
+                private final Map<UUID, BossBar> activeBossBars = new HashMap<>();
+
 
     @Override
     public void onEnable() {
@@ -73,12 +89,10 @@ public final class PvPInvite extends JavaPlugin
          * 每秒檢查過期邀請。
          * 不會每秒寫 Log。
          */
-        Bukkit.getScheduler().runTaskTimer(
-                this,
-                this::cleanupExpiredInvites,
-                20L,
-                20L
-        );
+        Bukkit.getScheduler().runTaskTimer(this, () -> {
+            cleanupExpiredInvites();
+            updateBossBars();
+        }, 20L, 20L);
 
         getLogger().info("PvPInvite enabled.");
     }
@@ -90,6 +104,11 @@ public final class PvPInvite extends JavaPlugin
         pendingByInviter.clear();
         pendingByTarget.clear();
         activePairs.clear();
+        roomsByPlayer.clear();
+        activeTeamBattles.clear();
+        pendingTeamInvites.clear();
+        activeBossBars.values().forEach(BossBar::removeAll);
+        activeBossBars.clear();
     }
 
 
@@ -258,82 +277,432 @@ public final class PvPInvite extends JavaPlugin
         );
 
 
-        /*
-         * 接受按鈕
-         */
-        Component accept =
-                Component.text(
-                        " ✓ 接受 ",
-                        NamedTextColor.GREEN
-                )
-                .clickEvent(
-                        ClickEvent.runCommand(
-                                "/pvp accept"
-                        )
-                )
-                .hoverEvent(
-                        HoverEvent.showText(
-                                Component.text(
-                                        "接受 PvP 邀請"
-                                )
+        showInviteDialog(target, inviter.getName());
+    }
+
+
+    private void showModeSelectionDialog(Player inviter) {
+
+        ActionButton oneVsOne =
+                ActionButton.create(
+                        Component.text("單挑（1v1）", NamedTextColor.GREEN),
+                        Component.text("選擇一名玩家進行單挑"),
+                        200,
+                        DialogAction.staticAction(
+                                ClickEvent.runCommand("/pvp select-1v1")
                         )
                 );
 
-
-        /*
-         * 拒絕按鈕
-         */
-        Component deny =
-                Component.text(
-                        " ✕ 拒絕 ",
-                        NamedTextColor.RED
-                )
-                .clickEvent(
-                        ClickEvent.runCommand(
-                                "/pvp deny"
-                        )
-                )
-                .hoverEvent(
-                        HoverEvent.showText(
-                                Component.text(
-                                        "拒絕 PvP 邀請"
-                                )
+        ActionButton teamBattle =
+                ActionButton.create(
+                        Component.text("多人組隊（1+v1+）", NamedTextColor.AQUA),
+                        Component.text("建立或查看兩隊 PvP 房間"),
+                        200,
+                        DialogAction.staticAction(
+                                ClickEvent.runCommand("/pvp select-team")
                         )
                 );
 
-
-        target.sendMessage(
-                Component.text(
-                        "⚔ PvP 邀請",
-                        NamedTextColor.GOLD
-                )
-        );
-
-
-        target.sendMessage(
-                Component.text(
-                        inviter.getName()
-                                + " 邀請你進行 PvP！",
-                        NamedTextColor.WHITE
-                )
-        );
-
-
-        target.sendMessage(
-                accept
-                        .append(
-                                Component.text("   ")
+        Dialog dialog = Dialog.create(builder -> builder
+                .empty()
+                .base(
+                        DialogBase.create(
+                                Component.text("選擇 PvP 模式", NamedTextColor.GOLD),
+                                Component.text("選擇 PvP 模式"),
+                                true,
+                                false,
+                                DialogBase.DialogAfterAction.CLOSE,
+                                List.of(
+                                        DialogBody.plainMessage(
+                                                Component.text(
+                                                        "請先選擇要進行的 PvP 模式。",
+                                                        NamedTextColor.WHITE
+                                                )
+                                        )
+                                ),
+                                List.of()
                         )
-                        .append(deny)
-        );
-
-
-        target.sendMessage(
-                Component.text(
-                        "邀請將在 60 秒後失效。",
-                        NamedTextColor.GRAY
                 )
+                .type(DialogType.multiAction(List.of(oneVsOne, teamBattle), null, 2))
         );
+
+        inviter.showDialog(dialog);
+    }
+
+
+    private void showTeamRoomDialog(Player player) {
+
+        TeamRoom room = roomsByPlayer.get(player.getUniqueId());
+
+        if (room == null) {
+            room = new TeamRoom(player.getUniqueId());
+            roomsByPlayer.put(player.getUniqueId(), room);
+            room.teamA.add(player.getUniqueId());
+        }
+
+        boolean owner = room.owner.equals(player.getUniqueId());
+        boolean inBattle = activeTeamBattles.contains(room);
+        List<ActionButton> buttons = new ArrayList<>();
+
+        buttons.add(ActionButton.create(
+                Component.text("A隊（" + room.teamA.size() + "人）", NamedTextColor.GREEN),
+                Component.text(teamList(room.teamA)),
+                180,
+                DialogAction.staticAction(ClickEvent.runCommand("/pvp team-view a"))
+        ));
+        buttons.add(ActionButton.create(
+                Component.text("B隊（" + room.teamB.size() + "人）", NamedTextColor.RED),
+                Component.text(teamList(room.teamB)),
+                180,
+                DialogAction.staticAction(ClickEvent.runCommand("/pvp team-view b"))
+        ));
+
+        if (owner && !inBattle) {
+            buttons.add(ActionButton.create(
+                    Component.text("邀請玩家", NamedTextColor.YELLOW),
+                    Component.text("選擇要加入的隊伍"),
+                    180,
+                    DialogAction.staticAction(ClickEvent.runCommand("/pvp team-invite"))
+            ));
+            buttons.add(ActionButton.create(
+                    Component.text("開戰", NamedTextColor.GOLD),
+                    Component.text("兩隊都有人後開始戰鬥"),
+                    180,
+                    DialogAction.staticAction(ClickEvent.runCommand("/pvp team-start"))
+            ));
+        }
+
+        if (!owner && !inBattle) {
+            buttons.add(ActionButton.create(
+                    Component.text("退出房間", NamedTextColor.GRAY),
+                    Component.text("離開目前的多人房間"),
+                    180,
+                    DialogAction.staticAction(ClickEvent.runCommand("/pvp team-leave"))
+            ));
+        }
+
+        String position = room.teamA.contains(player.getUniqueId()) ? "你在A隊"
+                : room.teamB.contains(player.getUniqueId()) ? "你在B隊" : "你不在隊伍中";
+        List<DialogBody> body = List.of(DialogBody.plainMessage(Component.text(
+                "多人組隊（1+v1+）\n" + position + "\n房主：" + playerName(room.owner)
+                        + (inBattle ? "\n戰鬥進行中" : ""),
+                NamedTextColor.WHITE)));
+
+        Dialog dialog = Dialog.create(builder -> builder
+                .empty()
+                .base(DialogBase.create(
+                        Component.text("多人組隊（1+v1+）", NamedTextColor.GOLD),
+                        Component.text("多人組隊（1+v1+）"), true, false,
+                        DialogBase.DialogAfterAction.CLOSE, body, List.of()))
+                .type(DialogType.multiAction(buttons, null, 2)));
+
+        player.showDialog(dialog);
+    }
+
+
+    private String teamList(Set<UUID> team) {
+        if (team.isEmpty()) {
+            return "目前沒有玩家";
+        }
+        return team.stream().map(this::playerName).collect(java.util.stream.Collectors.joining(", "));
+    }
+
+
+    private String playerName(UUID uuid) {
+        Player player = Bukkit.getPlayer(uuid);
+        return player == null ? uuid.toString().substring(0, 8) : player.getName();
+    }
+
+
+        private void showTeamView(Player player, String teamName) {
+                TeamRoom room = roomsByPlayer.get(player.getUniqueId());
+                if (room == null) {
+                        player.sendMessage(Component.text("你目前不在多人房間。", NamedTextColor.RED));
+                        return;
+                }
+
+                Set<UUID> team = teamName.equalsIgnoreCase("b") ? room.teamB : room.teamA;
+                List<ActionButton> buttons = new ArrayList<>();
+                if (room.owner.equals(player.getUniqueId()) && !activeTeamBattles.contains(room)) {
+                        for (UUID member : team) {
+                                if (!member.equals(room.owner)) {
+                                        buttons.add(ActionButton.create(
+                                                        Component.text("踢出 " + playerName(member), NamedTextColor.RED),
+                                                        Component.text("從房間移除此玩家"), 180,
+                                                        DialogAction.staticAction(ClickEvent.runCommand(
+                                                                        "/pvp team-kick " + member))));
+                                }
+                        }
+                }
+                buttons.add(ActionButton.create(
+                                Component.text("返回房間", NamedTextColor.GRAY),
+                                Component.text("查看兩個小隊"), 180,
+                                DialogAction.staticAction(ClickEvent.runCommand("/pvp team-room"))));
+
+                Dialog dialog = Dialog.create(builder -> builder
+                                .empty()
+                                .base(DialogBase.create(
+                                                Component.text(teamName.equalsIgnoreCase("b") ? "B隊玩家" : "A隊玩家", NamedTextColor.GOLD),
+                                                Component.text("小隊玩家列表"), true, false,
+                                                DialogBase.DialogAfterAction.CLOSE,
+                                                List.of(DialogBody.plainMessage(Component.text(teamList(team), NamedTextColor.WHITE))),
+                                                List.of()))
+                                .type(DialogType.multiAction(buttons, null, 2)));
+                player.showDialog(dialog);
+        }
+
+
+        private void showTeamInviteDialog(Player owner) {
+                TeamRoom room = roomsByPlayer.get(owner.getUniqueId());
+                if (room == null || !room.owner.equals(owner.getUniqueId())) {
+                        owner.sendMessage(Component.text("只有房主可以邀請玩家。", NamedTextColor.RED));
+                        return;
+                }
+
+                List<ActionButton> buttons = new ArrayList<>();
+                for (Player target : Bukkit.getOnlinePlayers()) {
+                        if (roomsByPlayer.containsKey(target.getUniqueId()) || target.equals(owner)) {
+                                continue;
+                        }
+                        buttons.add(ActionButton.create(
+                                        Component.text(target.getName()), Component.text("邀請加入多人房間"), 180,
+                                        DialogAction.staticAction(ClickEvent.runCommand(
+                                                        "/pvp team-invite-player " + target.getName()))));
+                }
+                if (buttons.isEmpty()) {
+                        owner.sendMessage(Component.text("目前沒有可邀請的在線玩家。", NamedTextColor.GRAY));
+                        return;
+                }
+                buttons.add(ActionButton.create(
+                                Component.text("返回房間", NamedTextColor.GRAY), Component.text("返回多人房間"), 180,
+                                DialogAction.staticAction(ClickEvent.runCommand("/pvp team-room"))));
+                Dialog dialog = Dialog.create(builder -> builder
+                                .empty()
+                                .base(DialogBase.create(
+                                                Component.text("邀請玩家", NamedTextColor.GOLD), Component.text("邀請玩家加入房間"),
+                                                true, false, DialogBase.DialogAfterAction.CLOSE,
+                                                List.of(DialogBody.plainMessage(Component.text("先選擇玩家，再選擇加入的隊伍。", NamedTextColor.WHITE))),
+                                                List.of()))
+                                .type(DialogType.multiAction(buttons, null, 2)));
+                owner.showDialog(dialog);
+        }
+
+
+        private void chooseTeamForInvite(Player owner, Player target) {
+                TeamRoom room = roomsByPlayer.get(owner.getUniqueId());
+                if (room == null || !room.owner.equals(owner.getUniqueId())) {
+                        return;
+                }
+                List<ActionButton> buttons = List.of(
+                                ActionButton.create(Component.text("加入A隊", NamedTextColor.GREEN), Component.text("邀請加入A隊"), 180,
+                                                DialogAction.staticAction(ClickEvent.runCommand("/pvp team-send " + target.getName() + " a"))),
+                                ActionButton.create(Component.text("加入B隊", NamedTextColor.RED), Component.text("邀請加入B隊"), 180,
+                                                DialogAction.staticAction(ClickEvent.runCommand("/pvp team-send " + target.getName() + " b"))));
+                Dialog dialog = Dialog.create(builder -> builder
+                                .empty()
+                                .base(DialogBase.create(Component.text("選擇隊伍", NamedTextColor.GOLD), Component.text("選擇隊伍"),
+                                                true, false, DialogBase.DialogAfterAction.CLOSE,
+                                                List.of(DialogBody.plainMessage(Component.text("邀請 " + target.getName() + " 加入哪一隊？", NamedTextColor.WHITE))), List.of()))
+                                .type(DialogType.multiAction(buttons, null, 2)));
+                owner.showDialog(dialog);
+        }
+
+
+        private void sendTeamInvite(Player owner, Player target, boolean teamB) {
+                TeamRoom room = roomsByPlayer.get(owner.getUniqueId());
+                if (room == null || !room.owner.equals(owner.getUniqueId()) || roomsByPlayer.containsKey(target.getUniqueId())) {
+                        owner.sendMessage(Component.text("無法邀請這名玩家。", NamedTextColor.RED));
+                        return;
+                }
+                pendingTeamInvites.put(target.getUniqueId(), new TeamInvite(owner.getUniqueId(), teamB));
+                owner.sendMessage(Component.text("已邀請 " + target.getName() + " 加入" + (teamB ? "B隊" : "A隊") + "。", NamedTextColor.GREEN));
+                showTeamInviteAcceptance(target, owner.getName(), teamB);
+        }
+
+
+            private void showTeamInviteAcceptance(Player target, String ownerName, boolean teamB) {
+                ActionButton accept = ActionButton.create(
+                        Component.text("接受", NamedTextColor.GREEN), Component.text("加入多人房間"), 160,
+                        DialogAction.staticAction(ClickEvent.runCommand("/pvp team-accept")));
+                ActionButton deny = ActionButton.create(
+                        Component.text("拒絕", NamedTextColor.RED), Component.text("拒絕房間邀請"), 160,
+                        DialogAction.staticAction(ClickEvent.runCommand("/pvp team-deny")));
+                Dialog dialog = Dialog.create(builder -> builder
+                        .empty()
+                        .base(DialogBase.create(
+                                Component.text("多人房間邀請", NamedTextColor.GOLD), Component.text("多人房間邀請"),
+                                true, false, DialogBase.DialogAfterAction.CLOSE,
+                                List.of(DialogBody.plainMessage(Component.text(
+                                        ownerName + " 邀請你加入多人房間的" + (teamB ? "B隊" : "A隊") + "。", NamedTextColor.WHITE))),
+                                List.of()))
+                        .type(DialogType.multiAction(List.of(accept, deny), null, 2)));
+                target.showDialog(dialog);
+            }
+
+
+        private void acceptTeamInvite(Player player) {
+                TeamInvite invite = pendingTeamInvites.remove(player.getUniqueId());
+                TeamRoom room = invite == null ? null : roomsByPlayer.get(invite.owner);
+                if (invite == null || room == null || activeTeamBattles.contains(room)) {
+                        player.sendMessage(Component.text("沒有有效的多人房間邀請。", NamedTextColor.RED));
+                        return;
+                }
+                roomsByPlayer.put(player.getUniqueId(), room);
+                (invite.teamB ? room.teamB : room.teamA).add(player.getUniqueId());
+                player.sendMessage(Component.text("你已加入多人房間的" + (invite.teamB ? "B隊" : "A隊") + "。", NamedTextColor.GREEN));
+                showTeamRoomDialog(player);
+        }
+
+
+        private void leaveTeamRoom(Player player) {
+                TeamRoom room = roomsByPlayer.get(player.getUniqueId());
+                if (room == null) {
+                        return;
+                }
+                if (room.owner.equals(player.getUniqueId())) {
+                        player.sendMessage(Component.text("房主不能退出或被踢出房間。", NamedTextColor.RED));
+                        return;
+                }
+                removeFromRoom(player.getUniqueId(), room);
+                player.sendMessage(Component.text("你已退出多人房間。", NamedTextColor.GRAY));
+        }
+
+
+        private void kickFromTeamRoom(Player owner, UUID target) {
+                TeamRoom room = roomsByPlayer.get(owner.getUniqueId());
+                if (room == null || !room.owner.equals(owner.getUniqueId()) || target.equals(room.owner)
+                                || activeTeamBattles.contains(room) || !roomsByPlayer.containsKey(target)) {
+                        owner.sendMessage(Component.text("無法踢出這名玩家。", NamedTextColor.RED));
+                        return;
+                }
+                removeFromRoom(target, room);
+                Player kicked = Bukkit.getPlayer(target);
+                if (kicked != null) {
+                        kicked.sendMessage(Component.text("你已被房主踢出多人房間。", NamedTextColor.RED));
+                }
+                showTeamRoomDialog(owner);
+        }
+
+
+        private void removeFromRoom(UUID uuid, TeamRoom room) {
+                roomsByPlayer.remove(uuid);
+                room.teamA.remove(uuid);
+                room.teamB.remove(uuid);
+        }
+
+
+    private void showPlayerSelectionDialog(Player inviter) {
+
+        List<ActionButton> playerButtons =
+                new ArrayList<>();
+
+        for (Player target : Bukkit.getOnlinePlayers()) {
+
+            if (target.equals(inviter)) {
+                continue;
+            }
+
+            playerButtons.add(
+                    ActionButton.create(
+                            Component.text(target.getName()),
+                            Component.text("邀請 " + target.getName() + " 進行 PvP"),
+                            160,
+                            DialogAction.staticAction(
+                                    ClickEvent.runCommand(
+                                            "/pvp " + target.getName()
+                                    )
+                            )
+                    )
+            );
+        }
+
+        if (playerButtons.isEmpty()) {
+
+            inviter.sendMessage(
+                    Component.text(
+                            "目前沒有其他在線玩家可以邀請。",
+                            NamedTextColor.GRAY
+                    )
+            );
+
+            return;
+        }
+
+        Dialog dialog = Dialog.create(builder -> builder
+                .empty()
+                .base(
+                        DialogBase.create(
+                                Component.text("選擇 PvP 對手", NamedTextColor.GOLD),
+                                Component.text("選擇 PvP 對手"),
+                                true,
+                                false,
+                                DialogBase.DialogAfterAction.CLOSE,
+                                List.of(
+                                        DialogBody.plainMessage(
+                                                Component.text(
+                                                        "選擇一名在線玩家發送 PvP 邀請。",
+                                                        NamedTextColor.WHITE
+                                                )
+                                        )
+                                ),
+                                List.of()
+                        )
+                )
+                .type(DialogType.multiAction(playerButtons, null, 2))
+        );
+
+        inviter.showDialog(dialog);
+    }
+
+
+    private void showInviteDialog(Player target, String inviterName) {
+
+        ActionButton accept =
+                ActionButton.create(
+                        Component.text("接受", NamedTextColor.GREEN),
+                        Component.text("接受 PvP 邀請"),
+                        160,
+                        DialogAction.staticAction(
+                                ClickEvent.runCommand("/pvp accept")
+                        )
+                );
+
+        ActionButton deny =
+                ActionButton.create(
+                        Component.text("拒絕", NamedTextColor.RED),
+                        Component.text("拒絕 PvP 邀請"),
+                        160,
+                        DialogAction.staticAction(
+                                ClickEvent.runCommand("/pvp deny")
+                        )
+                );
+
+        Dialog dialog = Dialog.create(builder -> builder
+                .empty()
+                .base(
+                        DialogBase.create(
+                                Component.text("PvP 邀請", NamedTextColor.GOLD),
+                                Component.text("PvP 邀請"),
+                                true,
+                                false,
+                                DialogBase.DialogAfterAction.CLOSE,
+                                List.of(
+                                        DialogBody.plainMessage(
+                                                Component.text(
+                                                        inviterName
+                                                                + " 邀請你進行 PvP！\n\n"
+                                                                + "邀請將在 60 秒後失效。",
+                                                        NamedTextColor.WHITE
+                                                )
+                                        )
+                                ),
+                                List.of()
+                        )
+                )
+                .type(DialogType.multiAction(List.of(accept, deny), null, 2))
+        );
+
+        target.showDialog(dialog);
     }
 
 
@@ -409,6 +778,7 @@ public final class PvPInvite extends JavaPlugin
 
 
         activePairs.add(pair);
+        updateBossBars();
 
 
         Component message =
@@ -515,6 +885,7 @@ public final class PvPInvite extends JavaPlugin
         activePairs.removeIf(
                 pair -> pair.contains(uuid)
         );
+        updateBossBars();
 
 
         /*
@@ -564,10 +935,129 @@ public final class PvPInvite extends JavaPlugin
             UUID second
     ) {
 
-        return activePairs.contains(
-                new PairKey(first, second)
-        );
+                if (activePairs.contains(new PairKey(first, second))) {
+                        return true;
+                }
+                TeamRoom room = roomsByPlayer.get(first);
+                return room != null && activeTeamBattles.contains(room)
+                        && room.allMembers().contains(second)
+                                && room.teamA.contains(first) != room.teamA.contains(second);
     }
+
+
+        private void updateBossBars() {
+                Set<UUID> battlePlayers = new HashSet<>();
+
+                for (PairKey pair : activePairs) {
+                        updateSingleBossBar(pair.first(), pair.second(), battlePlayers);
+                        updateSingleBossBar(pair.second(), pair.first(), battlePlayers);
+                }
+
+                for (TeamRoom room : activeTeamBattles) {
+                        for (UUID member : room.allMembers()) {
+                                updateTeamBossBar(member, room, battlePlayers);
+                        }
+                }
+
+                Iterator<Map.Entry<UUID, BossBar>> iterator = activeBossBars.entrySet().iterator();
+                while (iterator.hasNext()) {
+                        Map.Entry<UUID, BossBar> entry = iterator.next();
+                        if (!battlePlayers.contains(entry.getKey())) {
+                                entry.getValue().removeAll();
+                                iterator.remove();
+                        }
+                }
+        }
+
+
+        private void updateSingleBossBar(UUID viewerId, UUID opponentId, Set<UUID> battlePlayers) {
+                Player viewer = Bukkit.getPlayer(viewerId);
+                Player opponent = Bukkit.getPlayer(opponentId);
+                if (viewer == null || opponent == null) {
+                        return;
+                }
+
+                double progress = healthPercent(opponent);
+                BossBar bossBar = getBossBar(viewer);
+                bossBar.setTitle("對手 " + opponent.getName() + " 血量 " + percent(progress) + "%");
+                bossBar.setProgress(progress);
+                battlePlayers.add(viewerId);
+        }
+
+
+        private void updateTeamBossBar(UUID viewerId, TeamRoom room, Set<UUID> battlePlayers) {
+                Player viewer = Bukkit.getPlayer(viewerId);
+                if (viewer == null) {
+                        return;
+                }
+
+                Set<UUID> enemyTeam = room.teamA.contains(viewerId) ? room.teamB : room.teamA;
+                double maximumHealth = 0.0;
+                double currentHealth = 0.0;
+                for (UUID member : enemyTeam) {
+                        Player enemy = Bukkit.getPlayer(member);
+                        if (enemy != null) {
+                                maximumHealth += enemy.getMaxHealth();
+                                currentHealth += Math.max(0.0, enemy.getHealth());
+                        }
+                }
+
+                double progress = maximumHealth <= 0.0 ? 0.0 : clamp(currentHealth / maximumHealth);
+                BossBar bossBar = getBossBar(viewer);
+                bossBar.setTitle("敵隊總血量 " + percent(progress) + "%");
+                bossBar.setProgress(progress);
+                bossBar.setColor(BarColor.RED);
+                battlePlayers.add(viewerId);
+        }
+
+
+        private BossBar getBossBar(Player viewer) {
+                BossBar bossBar = activeBossBars.computeIfAbsent(
+                                viewer.getUniqueId(),
+                                ignored -> Bukkit.createBossBar("", BarColor.RED, BarStyle.SOLID));
+                if (!bossBar.getPlayers().contains(viewer)) {
+                        bossBar.addPlayer(viewer);
+                }
+                return bossBar;
+        }
+
+
+        private double healthPercent(Player player) {
+                return player.getMaxHealth() <= 0.0
+                                ? 0.0
+                                : clamp(player.getHealth() / player.getMaxHealth());
+        }
+
+
+        private double clamp(double value) {
+                return Math.max(0.0, Math.min(1.0, value));
+        }
+
+
+        private String percent(double value) {
+                return String.format(Locale.ROOT, "%.0f", value * 100.0);
+        }
+
+
+        private void startTeamBattle(Player owner) {
+                TeamRoom room = roomsByPlayer.get(owner.getUniqueId());
+                if (room == null || !room.owner.equals(owner.getUniqueId())) {
+                        owner.sendMessage(Component.text("只有房主可以開戰。", NamedTextColor.RED));
+                        return;
+                }
+                if (room.teamA.isEmpty() || room.teamB.isEmpty()) {
+                        owner.sendMessage(Component.text("A隊與B隊都至少需要一名玩家才能開戰。", NamedTextColor.RED));
+                        return;
+                }
+                activeTeamBattles.add(room);
+                updateBossBars();
+                for (UUID member : room.allMembers()) {
+                        Player player = Bukkit.getPlayer(member);
+                        if (player != null) {
+                                player.sendMessage(Component.text("多人組隊戰鬥開始！A隊與B隊可以交戰，隊友不會互相傷害。", NamedTextColor.GOLD));
+                        }
+                }
+        }
 
 
     /*
@@ -643,6 +1133,12 @@ public final class PvPInvite extends JavaPlugin
     }
 
 
+        private boolean isDead(UUID uuid) {
+                Player player = Bukkit.getPlayer(uuid);
+                return player == null || player.isDead();
+        }
+
+
    /*
  * 玩家死亡
  *
@@ -655,6 +1151,22 @@ public final class PvPInvite extends JavaPlugin
 public void onDeath(PlayerDeathEvent event) {
 
     Player loser = event.getEntity();
+
+                TeamRoom teamRoom = roomsByPlayer.get(loser.getUniqueId());
+                if (teamRoom != null && activeTeamBattles.contains(teamRoom)) {
+                        boolean teamADefeated = teamRoom.teamA.stream().allMatch(this::isDead);
+                        boolean teamBDefeated = teamRoom.teamB.stream().allMatch(this::isDead);
+                        boolean teamDefeated = teamADefeated || teamBDefeated;
+                        if (teamDefeated) {
+                                activeTeamBattles.remove(teamRoom);
+                                updateBossBars();
+                                String winner = teamADefeated ? "B隊" : "A隊";
+                                Bukkit.broadcast(Component.text(
+                                                "多人組隊戰鬥結束！" + winner + "獲勝。",
+                                                NamedTextColor.GOLD));
+                        }
+                        return;
+                }
 
     UUID loserUUID = loser.getUniqueId();
 
@@ -769,6 +1281,23 @@ public void onDeath(PlayerDeathEvent event) {
         UUID uuid =
                 event.getPlayer().getUniqueId();
 
+                TeamRoom teamRoom = roomsByPlayer.get(uuid);
+                if (teamRoom != null) {
+                        if (teamRoom.owner.equals(uuid)) {
+                                for (UUID member : teamRoom.allMembers()) {
+                                        Player player = Bukkit.getPlayer(member);
+                                        if (player != null && !member.equals(uuid)) {
+                                                player.sendMessage(Component.text("房主離線，多人房間已關閉。", NamedTextColor.GRAY));
+                                        }
+                                        roomsByPlayer.remove(member);
+                                }
+                                activeTeamBattles.remove(teamRoom);
+                                updateBossBars();
+                        } else {
+                                removeFromRoom(uuid, teamRoom);
+                        }
+                }
+
 
         /*
          * 取消發出的邀請
@@ -840,6 +1369,7 @@ public void onDeath(PlayerDeathEvent event) {
         activePairs.removeIf(
                 pair -> pair.contains(uuid)
         );
+        updateBossBars();
     }
 
 
@@ -866,18 +1396,65 @@ public void onDeath(PlayerDeathEvent event) {
 
         if (args.length == 0) {
 
-            player.sendMessage(
-                    Component.text(
-                            "/pvp <玩家> | /pvp accept | /pvp deny | /pvp cancel | /pvp status",
-                            NamedTextColor.YELLOW
-                    )
-            );
+                        showModeSelectionDialog(player);
 
             return true;
         }
 
 
         switch (args[0].toLowerCase(Locale.ROOT)) {
+
+                        case "select-1v1" -> showPlayerSelectionDialog(player);
+
+                        case "select-team", "team-room" -> showTeamRoomDialog(player);
+
+                        case "team-view" -> {
+                                if (args.length == 2) {
+                                        showTeamView(player, args[1]);
+                                }
+                        }
+
+                        case "team-invite" -> showTeamInviteDialog(player);
+
+                        case "team-invite-player" -> {
+                                if (args.length == 2) {
+                                        Player target = Bukkit.getPlayerExact(args[1]);
+                                        if (target != null) {
+                                                chooseTeamForInvite(player, target);
+                                        }
+                                }
+                        }
+
+                        case "team-send" -> {
+                                if (args.length == 3) {
+                                        Player target = Bukkit.getPlayerExact(args[1]);
+                                        if (target != null) {
+                                                sendTeamInvite(player, target, args[2].equalsIgnoreCase("b"));
+                                        }
+                                }
+                        }
+
+                        case "team-accept" -> acceptTeamInvite(player);
+
+                        case "team-deny" -> {
+                                if (pendingTeamInvites.remove(player.getUniqueId()) != null) {
+                                        player.sendMessage(Component.text("已拒絕多人房間邀請。", NamedTextColor.GRAY));
+                                }
+                        }
+
+                        case "team-leave" -> leaveTeamRoom(player);
+
+                        case "team-kick" -> {
+                                if (args.length == 2) {
+                                        try {
+                                                kickFromTeamRoom(player, UUID.fromString(args[1]));
+                                        } catch (IllegalArgumentException exception) {
+                                                player.sendMessage(Component.text("無效的玩家。", NamedTextColor.RED));
+                                        }
+                                }
+                        }
+
+                        case "team-start" -> startTeamBattle(player);
 
             case "accept" -> acceptInvite(player);
 
@@ -989,7 +1566,12 @@ public void onDeath(PlayerDeathEvent event) {
                                     "accept",
                                     "deny",
                                     "cancel",
-                                    "status"
+                                    "status",
+                                    "select-team",
+                                    "team-room",
+                                    "team-accept",
+                                    "team-leave",
+                                    "team-start"
                             )
                     );
 
@@ -1029,6 +1611,27 @@ public void onDeath(PlayerDeathEvent event) {
     /*
      * 邀請資料
      */
+        private static final class TeamRoom {
+
+                private final UUID owner;
+                private final Set<UUID> teamA = new HashSet<>();
+                private final Set<UUID> teamB = new HashSet<>();
+
+                private TeamRoom(UUID owner) {
+                        this.owner = owner;
+                }
+
+                private Set<UUID> allMembers() {
+                        Set<UUID> members = new HashSet<>(teamA);
+                        members.addAll(teamB);
+                        return members;
+                }
+        }
+
+
+        private record TeamInvite(UUID owner, boolean teamB) {}
+
+
     private record Invite(
             UUID inviter,
             UUID target,
